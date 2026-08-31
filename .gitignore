@@ -1,0 +1,32 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Local bundled runtimes and generated work directories
+.runtime/
+*.work/
+*.y4m
+
+# Local media inputs, masks, previews, and generated outputs
+*.mov
+*.mp4
+*.mkv
+*.avi
+*.webm
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
