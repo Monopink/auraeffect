@@ -424,11 +424,34 @@ def remux_audio(
     )
 
 
+def _default_output_path(input_path: Path) -> Path:
+    parent = input_path.parent
+    stem = input_path.stem
+    suffix = input_path.suffix
+    for index in range(1, 10_000):
+        tag = "_ae" if index == 1 else f"_ae{index}"
+        candidate = parent / f"{stem}{tag}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise SystemExit(f"could not find an available output name near: {input_path}")
+
+
+def _prompt_overwrite(path: Path) -> bool:
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        raise SystemExit(f"output exists, refusing to overwrite in non-interactive mode: {path}")
+    while True:
+        answer = input(f"output exists: {path}\noverwrite? [y/N] ").strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("", "n", "no"):
+            return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="auraeffect")
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--mask", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--radius", type=float, default=5.0)
     parser.add_argument("--sharpness", type=float, default=30.0)
     parser.add_argument("--preblur", type=float, default=0.5)
@@ -444,12 +467,17 @@ def main(argv: list[str] | None = None) -> int:
 
     input_path = args.input.resolve()
     mask_path = args.mask.resolve()
-    output_path = args.output.resolve()
 
     if not input_path.exists():
         raise SystemExit(f"missing input: {input_path}")
     if not mask_path.exists():
         raise SystemExit(f"missing mask: {mask_path}")
+
+    explicit_output = args.output is not None
+    output_path = args.output.resolve() if explicit_output else _default_output_path(input_path)
+    if explicit_output and output_path.exists():
+        if not _prompt_overwrite(output_path):
+            raise SystemExit("aborted by user")
 
     probe = probe_video(runtime.ffprobe, input_path)
     if probe.fps <= 0:
