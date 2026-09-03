@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import struct
+import time
 import zlib
 from dataclasses import dataclass
 from fractions import Fraction
@@ -23,10 +24,22 @@ class ProbeInfo:
     fps: float
     frame_count: int
 
+    @property
+    def duration_seconds(self) -> float:
+        if self.fps <= 0:
+            return 0.0
+        return self.frame_count / self.fps
+
 
 ENGINE_AUTO = "auto"
 ENGINE_AVSINPAINT = "avsinpaint"
 ENGINE_INPAINTDELOGO = "inpaintdelogo"
+
+
+def _decode_stderr(data: bytes | None) -> str:
+    if not data:
+        return ""
+    return data.decode("utf-8", errors="replace")
 
 
 def _run(cmd: list[str], *, stdout=None, stderr=None, env=None) -> None:
@@ -34,7 +47,7 @@ def _run(cmd: list[str], *, stdout=None, stderr=None, env=None) -> None:
     if proc.returncode != 0:
         details = ""
         if proc.stderr:
-            details = "\n" + proc.stderr.decode("utf-8", errors="replace")
+            details = "\n" + _decode_stderr(proc.stderr)
         raise RuntimeError(f"command failed: {' '.join(cmd)}{details}")
 
 
@@ -73,24 +86,220 @@ def probe_video(ffprobe: Path, input_path: Path) -> ProbeInfo:
     return ProbeInfo(width=width, height=height, fps=fps, frame_count=frame_count)
 
 
-def extract_frames(ffmpeg: Path, input_path: Path, frames_dir: Path) -> None:
+def _clamp_fraction(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _format_seconds(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _parse_ffmpeg_timestamp(value: str) -> float:
+    parts = value.strip().split(":")
+    if len(parts) != 3:
+        return 0.0
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+    except ValueError:
+        return 0.0
+    return hours * 3600 + minutes * 60 + seconds
+
+
+class ProgressBar:
+    def __init__(self, total_stages: int, *, stream=None) -> None:
+        self.total_stages = total_stages
+        self.stream = stream or sys.stderr
+        self.enabled = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._current_stage = 0
+        self._current_label = ""
+        self._last_width = 0
+        self._last_render_at = 0.0
+        self._line_open = False
+
+    def start(self, stage: int, label: str) -> None:
+        self._current_stage = stage
+        self._current_label = label
+        self._last_render_at = 0.0
+        if self.enabled:
+            self.update(0.0)
+            return
+        print(f"[{stage}/{self.total_stages}] {label}...", file=self.stream)
+
+    def update(self, fraction: float, detail: str = "") -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        fraction = _clamp_fraction(fraction)
+        if fraction < 1.0 and now - self._last_render_at < 0.1:
+            return
+        self._last_render_at = now
+        width = 28
+        filled = min(width, int(round(width * fraction)))
+        bar = "#" * filled + "-" * (width - filled)
+        percent = int(round(fraction * 100))
+        line = f"[{self._current_stage}/{self.total_stages}] {self._current_label:<18} [{bar}] {percent:>3}%"
+        if detail:
+            line += f" {detail}"
+        padding = " " * max(0, self._last_width - len(line))
+        self.stream.write("\r" + line + padding)
+        self.stream.flush()
+        self._last_width = len(line)
+        self._line_open = True
+
+    def finish(self, detail: str = "") -> None:
+        if self.enabled:
+            self.update(1.0, detail)
+            if self._line_open:
+                self.stream.write("\n")
+                self.stream.flush()
+                self._line_open = False
+            return
+        suffix = f" ({detail})" if detail else ""
+        print(f"[{self._current_stage}/{self.total_stages}] {self._current_label} complete{suffix}", file=self.stream)
+
+    def fail(self) -> None:
+        if self.enabled and self._line_open:
+            self.stream.write("\n")
+            self.stream.flush()
+            self._line_open = False
+
+
+def _run_ffmpeg_with_progress(
+    cmd: list[str],
+    *,
+    total_seconds: float,
+    progress: ProgressBar,
+    stage: int,
+    label: str,
+) -> None:
+    progress.start(stage, label)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stderr_lines: list[str] = []
+    current_seconds = 0.0
+    try:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_lines.append(line)
+            entry = line.strip()
+            if "=" not in entry:
+                continue
+            key, value = entry.split("=", 1)
+            if key == "out_time":
+                current_seconds = _parse_ffmpeg_timestamp(value)
+                detail = f"{_format_seconds(current_seconds)}/{_format_seconds(total_seconds)}"
+                fraction = current_seconds / total_seconds if total_seconds > 0 else 0.0
+                progress.update(min(fraction, 0.99), detail)
+    finally:
+        return_code = proc.wait()
+    if return_code != 0:
+        progress.fail()
+        details = "".join(stderr_lines).strip()
+        if details:
+            raise RuntimeError(f"command failed: {' '.join(cmd)}\n{details}")
+        raise RuntimeError(f"command failed: {' '.join(cmd)}")
+    progress.finish(f"{_format_seconds(total_seconds)}/{_format_seconds(total_seconds)}")
+
+
+def _estimate_y4m_bytes(probe: ProbeInfo) -> int:
+    frame_bytes = (probe.width * probe.height * 3) // 2
+    return 128 + probe.frame_count * (frame_bytes + len("FRAME\n"))
+
+
+def _estimate_y4m_frames(size_bytes: int, probe: ProbeInfo) -> int:
+    frame_packet_bytes = ((probe.width * probe.height * 3) // 2) + len("FRAME\n")
+    payload = max(0, size_bytes - 128)
+    if frame_packet_bytes <= 0:
+        return 0
+    return min(probe.frame_count, payload // frame_packet_bytes)
+
+
+def _run_avs2pipemod_with_progress(
+    cmd: list[str],
+    *,
+    y4m_path: Path,
+    probe: ProbeInfo,
+    progress: ProgressBar,
+    stage: int,
+    label: str,
+    env: dict[str, str] | None = None,
+) -> None:
+    progress.start(stage, label)
+    expected_bytes = max(1, _estimate_y4m_bytes(probe))
+    with y4m_path.open("wb") as out:
+        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.PIPE, env=env)
+        stderr_data = b""
+        try:
+            while True:
+                return_code = proc.poll()
+                size_bytes = y4m_path.stat().st_size if y4m_path.exists() else 0
+                frame_count = _estimate_y4m_frames(size_bytes, probe)
+                fraction = size_bytes / expected_bytes
+                if return_code is None:
+                    progress.update(min(fraction, 0.99), f"{frame_count}/{probe.frame_count} frames")
+                    time.sleep(0.2)
+                    continue
+                stderr_data = proc.stderr.read() if proc.stderr else b""
+                break
+        finally:
+            return_code = proc.wait()
+    if return_code != 0:
+        progress.fail()
+        details = _decode_stderr(stderr_data).strip()
+        if details:
+            raise RuntimeError(f"command failed: {' '.join(cmd)}\n{details}")
+        raise RuntimeError(f"command failed: {' '.join(cmd)}")
+    progress.finish(f"{probe.frame_count}/{probe.frame_count} frames")
+
+
+def extract_frames(
+    ffmpeg: Path,
+    input_path: Path,
+    frames_dir: Path,
+    *,
+    probe: ProbeInfo,
+    progress: ProgressBar,
+    stage: int,
+) -> None:
     frames_dir.mkdir(parents=True, exist_ok=True)
-    _run([
-        str(ffmpeg),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-fps_mode",
-        "passthrough",
-        "-start_number",
-        "0",
-        str(frames_dir / "%06d.png"),
-    ])
+    _run_ffmpeg_with_progress(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-progress",
+            "pipe:2",
+            "-y",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-fps_mode",
+            "passthrough",
+            "-start_number",
+            "0",
+            str(frames_dir / "%06d.png"),
+        ],
+        total_seconds=probe.duration_seconds,
+        progress=progress,
+        stage=stage,
+        label="Extracting frames",
+    )
 
 
 def _even_floor(value: int) -> int:
@@ -302,6 +511,10 @@ def encode_video(
     y4m_path: Path,
     video_path: Path,
     *,
+    probe: ProbeInfo,
+    progress: ProgressBar,
+    render_stage: int,
+    encode_stage: int,
     extra_path_dirs: list[Path] | None = None,
 ) -> None:
     env = None
@@ -309,58 +522,92 @@ def encode_video(
         env = os.environ.copy()
         path_parts = [str(p) for p in extra_path_dirs if p]
         env["PATH"] = os.pathsep.join(path_parts + [env.get("PATH", "")])
-    with y4m_path.open("wb") as out:
-        _run([
+    _run_avs2pipemod_with_progress(
+        [
             str(avs2pipemod),
             f"-dll={avi_string(avs_dll)}",
             "-y4mp",
             str(script_path),
-        ], stdout=out, stderr=subprocess.PIPE, env=env)
-    _run([
-        str(ffmpeg),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(y4m_path),
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        "18",
-        "-preset",
-        "medium",
-        "-movflags",
-        "+faststart",
-        "-an",
-        str(video_path),
-    ])
+        ],
+        y4m_path=y4m_path,
+        probe=probe,
+        progress=progress,
+        stage=render_stage,
+        label="Rendering script",
+        env=env,
+    )
+    _run_ffmpeg_with_progress(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-progress",
+            "pipe:2",
+            "-y",
+            "-i",
+            str(y4m_path),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
+            "-preset",
+            "medium",
+            "-movflags",
+            "+faststart",
+            "-an",
+            str(video_path),
+        ],
+        total_seconds=probe.duration_seconds,
+        progress=progress,
+        stage=encode_stage,
+        label="Encoding video",
+    )
 
 
-def remux_audio(ffmpeg: Path, video_path: Path, input_path: Path, output_path: Path) -> None:
-    _run([
-        str(ffmpeg),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(video_path),
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a?",
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        "-shortest",
-        str(output_path),
-    ])
+def remux_audio(
+    ffmpeg: Path,
+    video_path: Path,
+    input_path: Path,
+    output_path: Path,
+    *,
+    probe: ProbeInfo,
+    progress: ProgressBar,
+    stage: int,
+) -> None:
+    _run_ffmpeg_with_progress(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-progress",
+            "pipe:2",
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-shortest",
+            str(output_path),
+        ],
+        total_seconds=probe.duration_seconds,
+        progress=progress,
+        stage=stage,
+        label="Remuxing audio",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -380,6 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runtime = discover_runtime()
+    progress = ProgressBar(total_stages=4)
 
     input_path = args.input.resolve()
     mask_path = args.mask.resolve()
@@ -409,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 engine = ENGINE_AVSINPAINT
 
-        extract_frames(runtime.ffmpeg, input_path, frames_dir)
+        extract_frames(runtime.ffmpeg, input_path, frames_dir, probe=probe, progress=progress, stage=1)
         if engine == ENGINE_AVSINPAINT:
             _make_avs_script(
                 script_path=script_path,
@@ -465,8 +713,20 @@ def main(argv: list[str] | None = None) -> int:
                 postblur=args.postblur,
             )
         extra_path_dirs = [runtime.neo_fft3d_dll.parent] if engine == ENGINE_INPAINTDELOGO and runtime.neo_fft3d_dll else None
-        encode_video(runtime.ffmpeg, runtime.avs2pipemod, runtime.avisynth_dll, script_path, y4m_path, encoded_path, extra_path_dirs=extra_path_dirs)
-        remux_audio(runtime.ffmpeg, encoded_path, input_path, output_path)
+        encode_video(
+            runtime.ffmpeg,
+            runtime.avs2pipemod,
+            runtime.avisynth_dll,
+            script_path,
+            y4m_path,
+            encoded_path,
+            probe=probe,
+            progress=progress,
+            render_stage=2,
+            encode_stage=3,
+            extra_path_dirs=extra_path_dirs,
+        )
+        remux_audio(runtime.ffmpeg, encoded_path, input_path, output_path, probe=probe, progress=progress, stage=4)
         if args.keep_workdir:
             preserved = output_path.with_suffix(".work")
             preserved.parent.mkdir(parents=True, exist_ok=True)
