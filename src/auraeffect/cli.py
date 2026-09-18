@@ -14,6 +14,12 @@ from pathlib import Path
 from .runtime import avi_string, discover_runtime
 
 
+def _subprocess_options() -> dict[str, int]:
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
 @dataclass(frozen=True)
 class ProbeInfo:
     width: int
@@ -35,7 +41,7 @@ def _decode_stderr(data: bytes | None) -> str:
 
 
 def _run(cmd: list[str], *, stdout=None, stderr=None) -> None:
-    proc = subprocess.run(cmd, stdout=stdout, stderr=stderr, text=False)
+    proc = subprocess.run(cmd, stdout=stdout, stderr=stderr, text=False, **_subprocess_options())
     if proc.returncode != 0:
         details = ""
         if proc.stderr:
@@ -44,7 +50,7 @@ def _run(cmd: list[str], *, stdout=None, stderr=None) -> None:
 
 
 def _capture(cmd: list[str]) -> str:
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **_subprocess_options())
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"command failed: {' '.join(cmd)}")
     return proc.stdout
@@ -105,9 +111,10 @@ def _parse_ffmpeg_timestamp(value: str) -> float:
 
 
 class ProgressBar:
-    def __init__(self, total_stages: int, *, stream=None) -> None:
+    def __init__(self, total_stages: int, *, stream=None, on_event=None) -> None:
         self.total_stages = total_stages
         self.stream = stream or sys.stderr
+        self.on_event = on_event
         self.enabled = bool(getattr(self.stream, "isatty", lambda: False)())
         self._current_stage = 0
         self._current_label = ""
@@ -115,20 +122,33 @@ class ProgressBar:
         self._last_render_at = 0.0
         self._line_open = False
 
+    def _emit(self, event: str, **payload) -> None:
+        if self.on_event is not None:
+            self.on_event(event, payload)
+
     def start(self, stage: int, label: str) -> None:
         self._current_stage = stage
         self._current_label = label
         self._last_render_at = 0.0
+        self._emit("stage_start", stage=stage, total=self.total_stages, label=label)
         if self.enabled:
             self.update(0.0)
             return
         print(f"[{stage}/{self.total_stages}] {label}...", file=self.stream)
 
     def update(self, fraction: float, detail: str = "") -> None:
+        fraction = _clamp_fraction(fraction)
+        self._emit(
+            "progress",
+            stage=self._current_stage,
+            total=self.total_stages,
+            label=self._current_label,
+            fraction=fraction,
+            detail=detail,
+        )
         if not self.enabled:
             return
         now = time.monotonic()
-        fraction = _clamp_fraction(fraction)
         if fraction < 1.0 and now - self._last_render_at < 0.1:
             return
         self._last_render_at = now
@@ -146,6 +166,14 @@ class ProgressBar:
         self._line_open = True
 
     def finish(self, detail: str = "") -> None:
+        self._emit(
+            "stage_finish",
+            stage=self._current_stage,
+            total=self.total_stages,
+            label=self._current_label,
+            fraction=1.0,
+            detail=detail,
+        )
         if self.enabled:
             self.update(1.0, detail)
             if self._line_open:
@@ -157,6 +185,12 @@ class ProgressBar:
         print(f"[{self._current_stage}/{self.total_stages}] {self._current_label} complete{suffix}", file=self.stream)
 
     def fail(self) -> None:
+        self._emit(
+            "stage_fail",
+            stage=self._current_stage,
+            total=self.total_stages,
+            label=self._current_label,
+        )
         if self.enabled and self._line_open:
             self.stream.write("\n")
             self.stream.flush()
@@ -179,6 +213,7 @@ def _run_ffmpeg_with_progress(
         text=True,
         encoding="utf-8",
         errors="replace",
+        **_subprocess_options(),
     )
     stderr_lines: list[str] = []
     try:
@@ -230,7 +265,7 @@ def _run_avs2pipemod_with_progress(
     progress.start(stage, label)
     expected_bytes = max(1, _estimate_y4m_bytes(probe))
     with y4m_path.open("wb") as out:
-        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.PIPE, **_subprocess_options())
         stderr_data = b""
         try:
             while True:
@@ -447,42 +482,38 @@ def _prompt_overwrite(path: Path) -> bool:
             return False
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="auraeffect")
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--mask", required=True, type=Path)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--radius", type=float, default=5.0)
-    parser.add_argument("--sharpness", type=float, default=30.0)
-    parser.add_argument("--preblur", type=float, default=0.5)
-    parser.add_argument("--postblur", type=float, default=4.0)
-    parser.add_argument("--keep-workdir", action="store_true")
-    return parser
+def process_video(
+    input_path: Path,
+    mask_path: Path,
+    output_path: Path | None = None,
+    *,
+    radius: float = 5.0,
+    sharpness: float = 30.0,
+    preblur: float = 0.5,
+    postblur: float = 4.0,
+    keep_workdir: bool = False,
+    on_event=None,
+) -> Path:
+    """Process one video and return its output path.
 
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    This is the shared API used by both the command-line and GUI frontends.
+    """
     runtime = discover_runtime()
-    progress = ProgressBar(total_stages=4)
-
-    input_path = args.input.resolve()
-    mask_path = args.mask.resolve()
+    progress = ProgressBar(total_stages=4, on_event=on_event)
+    input_path = input_path.resolve()
+    mask_path = mask_path.resolve()
 
     if not input_path.exists():
-        raise SystemExit(f"missing input: {input_path}")
+        raise FileNotFoundError(f"missing input: {input_path}")
     if not mask_path.exists():
-        raise SystemExit(f"missing mask: {mask_path}")
+        raise FileNotFoundError(f"missing mask: {mask_path}")
 
-    explicit_output = args.output is not None
-    output_path = args.output.resolve() if explicit_output else _default_output_path(input_path)
-    if explicit_output and output_path.exists():
-        if not _prompt_overwrite(output_path):
-            raise SystemExit("aborted by user")
-
+    output_path = output_path.resolve() if output_path is not None else _default_output_path(input_path)
     probe = probe_video(runtime.ffprobe, input_path)
     if probe.fps <= 0:
-        raise SystemExit("could not determine source frame rate")
+        raise RuntimeError("could not determine source frame rate")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     with tempfile.TemporaryDirectory(prefix="auraeffect-") as tmpdir:
         tmp = Path(tmpdir)
         frames_dir = tmp / "frames"
@@ -501,10 +532,10 @@ def main(argv: list[str] | None = None) -> int:
             runtime_inpaint=runtime.avsinpaint_dll,
             runtime_masktools=runtime.masktools_dll,
             probe=probe,
-            radius=args.radius,
-            sharpness=args.sharpness,
-            preblur=args.preblur,
-            postblur=args.postblur,
+            radius=radius,
+            sharpness=sharpness,
+            preblur=preblur,
+            postblur=postblur,
         )
         encode_video(
             runtime.ffmpeg,
@@ -519,12 +550,44 @@ def main(argv: list[str] | None = None) -> int:
             encode_stage=3,
         )
         remux_audio(runtime.ffmpeg, encoded_path, input_path, output_path, probe=probe, progress=progress, stage=4)
-        if args.keep_workdir:
+        if keep_workdir:
             preserved = output_path.with_suffix(".work")
             preserved.parent.mkdir(parents=True, exist_ok=True)
             if preserved.exists():
                 shutil.rmtree(preserved)
             shutil.copytree(tmp, preserved)
+    return output_path
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="auraeffect")
+    parser.add_argument("--input", required=True, type=Path)
+    parser.add_argument("--mask", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--radius", type=float, default=5.0)
+    parser.add_argument("--sharpness", type=float, default=30.0)
+    parser.add_argument("--preblur", type=float, default=0.5)
+    parser.add_argument("--postblur", type=float, default=4.0)
+    parser.add_argument("--keep-workdir", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    explicit_output = args.output is not None
+    output_path = args.output.resolve() if explicit_output else _default_output_path(args.input.resolve())
+    if explicit_output and output_path.exists() and not _prompt_overwrite(output_path):
+        raise SystemExit("aborted by user")
+    process_video(
+        args.input,
+        args.mask,
+        output_path,
+        radius=args.radius,
+        sharpness=args.sharpness,
+        preblur=args.preblur,
+        postblur=args.postblur,
+        keep_workdir=args.keep_workdir,
+    )
     return 0
 
 

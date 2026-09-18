@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,13 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def runtime_root() -> Path:
+    """Return the bundled runtime directory in source and frozen builds."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "runtime"
+    return repo_root() / ".runtime"
+
+
 def _pick(paths: list[Path], *, prefer: tuple[str, ...] = (), avoid: tuple[str, ...] = ()) -> Path:
     filtered = [p for p in paths if all(token.lower() in str(p).lower() for token in prefer)]
     if not filtered:
@@ -32,7 +40,7 @@ def _pick(paths: list[Path], *, prefer: tuple[str, ...] = (), avoid: tuple[str, 
 
 
 def _find_exact(name: str, *, prefer: tuple[str, ...] = (), avoid: tuple[str, ...] = ()) -> Path:
-    root = repo_root()
+    root = runtime_root()
     candidates = [p for p in root.rglob(name) if p.is_file()]
     if not candidates:
         raise FileNotFoundError(f"could not find {name} under {root}")
