@@ -1,4 +1,4 @@
-# auraeffect
+# Auraeffect
 
 Local CLI tool for removing a fixed watermark area from a video with a mask image.
 
@@ -20,6 +20,14 @@ Local CLI tool for removing a fixed watermark area from a video with a mask imag
 ```powershell
 .venv\Scripts\python.exe -m auraeffect --input input.mov --mask mask.png --output output.mp4
 ```
+
+Starting without arguments opens the Windows GUI:
+
+```powershell
+.venv\Scripts\python.exe -m auraeffect
+```
+
+To build the portable Windows folder, run `scripts\build_windows.ps1` from PowerShell.
 
 ## Parameters
 
